@@ -147,9 +147,9 @@ def main():
         raise SystemExit("Install requirements-personal.txt (and requirements-mt5.txt for Windows execution)") from None
     except KeyboardInterrupt:
         pass
-    except Exception:
-        # Authentication errors may contain private account data; do not print them.
-        raise SystemExit("Personal client stopped. Check local Telegram access/network and MT5/journal state before restarting.") from None
+    except Exception as error:
+        # Show only the exception class; messages may contain private account data.
+        raise SystemExit(f"Personal client stopped ({type(error).__name__}). Check local Telegram access/network and MT5/journal state before restarting.") from None
 
 
 if __name__ == "__main__":

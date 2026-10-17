@@ -4,9 +4,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
-from personal_trade_bot import consume, normalize_event, personal_config, resolve_sources
+from personal_trade_bot import consume, main, normalize_event, personal_config, resolve_sources
 from trade_bot import ExecutionPolicy, Journal
 
 
@@ -20,6 +20,13 @@ def event(chat=-1001, outgoing=False, service=None, group=True, channel=True):
 
 
 class PersonalTests(unittest.TestCase):
+    def test_login_failure_reports_error_type_without_private_error_message(self):
+        with patch("sys.argv", ["personal_trade_bot.py", "--login"]), patch("personal_trade_bot.run", new=AsyncMock(side_effect=RuntimeError("private credential data"))):
+            with self.assertRaises(SystemExit) as result:
+                main()
+        self.assertIn("RuntimeError", str(result.exception))
+        self.assertNotIn("private credential data", str(result.exception))
+
     def test_selected_group_name_resolves_to_only_its_numeric_id(self):
         dialogs = [SimpleNamespace(id=-1001, name="TheGoldenEdge V2", is_group=True, is_channel=True),
                    SimpleNamespace(id=-1002, name="Other signals", is_group=True, is_channel=False)]
