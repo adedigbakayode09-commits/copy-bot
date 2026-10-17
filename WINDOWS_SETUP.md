@@ -22,8 +22,9 @@ In the same PowerShell window:
 ```powershell
 $env:TELEGRAM_API_ID = Read-Host "Telegram API ID"
 $env:TELEGRAM_API_HASH = [System.Net.NetworkCredential]::new("", (Read-Host "Telegram API hash" -AsSecureString)).Password
-$env:SOURCE_CHAT_NAME = "TheGoldenEdge V2"
-$env:SOURCE_CHAT_IDS = ""
+$env:SOURCE_CHAT_NAME = "TheGoldenEdgeVIP"
+$env:SOURCE_CHAT_IDS = "-1004418162453"
+$env:SOURCE_TOPIC_ID = "5"
 .\.venv\Scripts\python.exe personal_trade_bot.py --login
 ```
 
@@ -39,17 +40,17 @@ In the same PowerShell window:
 .\.venv\Scripts\python.exe personal_trade_bot.py
 ```
 
-It should report that it is listening to one allowed group in **PAPER** mode. It listens to new incoming messages only; it does not replay old signals. When a new recognized signal arrives, it logs the parsed signal and the selected lot allocation. No orders are sent in this mode. Press **Ctrl+C** to stop.
+It should report that it is listening to one allowed group in **PAPER** mode and show **Source topic: 5**. This is TheGoldenEdge V2 inside TheGoldenEdgeVIP, not the group's other topics. It listens to new incoming messages only; it does not replay old signals. When a new recognized signal arrives, it logs the parsed signal and the selected lot allocation. No orders are sent in this mode. Press **Ctrl+C** to stop.
 
 Your settings are 0.1 lot total: 0.05 at TP1, 0.03 at TP2, 0.02 at TP3; no open portion. The signal's risk percentage is ignored for sizing, and the signal SL is retained.
 
-If the name is missing or duplicated, stop and list your accessible groups:
+If the parent group cannot be found, stop and list your accessible groups:
 
 ```powershell
 .\.venv\Scripts\python.exe personal_trade_bot.py --list-chats
 ```
 
-Find the intended group's numeric ID and set `$env:SOURCE_CHAT_IDS` to that ID. This explicit ID takes precedence over the name. Only select the group you intend to use.
+Find the intended parent group's numeric ID and set `$env:SOURCE_CHAT_IDS` to that ID. This explicit ID takes precedence over the parent-group name. Keep `$env:SOURCE_TOPIC_ID = "5"` for the selected topic. Do not use the topic name as a parent-group lookup. Do not set the topic to `all` for this configuration, as that would include other topics.
 
 After closing PowerShell, repeat the API-credential and source-variable commands before starting again. The saved session normally avoids another phone/code login. The app does not read `.env` files automatically.
 

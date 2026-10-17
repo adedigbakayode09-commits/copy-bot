@@ -25,12 +25,34 @@ def personal_config(environ):
     return api_id, api_hash, session
 
 
-def normalize_event(event, sources):
+def read_topic(environ):
+    value = environ.get("SOURCE_TOPIC_ID", "").strip()
+    if value.lower() == "all":
+        return None
+    try:
+        topic = int(value)
+    except ValueError:
+        raise ValueError("Set SOURCE_TOPIC_ID to the selected numeric topic ID (5 for TheGoldenEdge V2); use all only to explicitly allow every topic") from None
+    if topic <= 0:
+        raise ValueError("SOURCE_TOPIC_ID must be positive")
+    return topic
+
+
+def normalize_event(event, sources, topic_id=None):
     """Normalize only new incoming group/channel messages from the allowlist."""
     if event.chat_id not in sources or event.message.out or event.message.action:
         return None
     if not (event.is_group or event.is_channel):
         return None
+    if topic_id is not None:
+        reply = getattr(event.message, "reply_to", None)
+        if reply is None or not getattr(reply, "forum_topic", False):
+            return None
+        # Replies within a topic identify the top message; direct topic posts
+        # may identify only the topic starter in reply_to_msg_id.
+        actual_topic = getattr(reply, "reply_to_top_id", None) or getattr(reply, "reply_to_msg_id", None)
+        if actual_topic != topic_id:
+            return None
     return {"message": {"chat": {"id": event.chat_id}, "message_id": event.message.id,
                         "date": event.message.date.timestamp(), "text": event.raw_text or ""}}
 
@@ -70,6 +92,7 @@ async def run(args):
     from telethon import TelegramClient, events
 
     api_id, api_hash, session = personal_config(os.environ)
+    topic_id = read_topic(os.environ) if not (args.login or args.list_chats) else None
     policy = execution_policy(os.environ)
     session.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     client = TelegramClient(str(session), api_id, api_hash, sequential_updates=True)
@@ -98,6 +121,8 @@ async def run(args):
                     print(f"{dialog.id}\t{dialog.name}")
             return
         sources = resolve_sources(os.environ, dialogs)
+        if topic_id is not None and len(sources) != 1:
+            raise ValueError("Select exactly one parent group when filtering by SOURCE_TOPIC_ID")
         if args.execute:
             import MetaTrader5 as mt5
             broker = MT5Broker(mt5, int(os.environ["MT5_ACCOUNT_ID"]), policy.total_lots, policy.target_lots)
@@ -107,13 +132,14 @@ async def run(args):
         queue = asyncio.Queue(maxsize=1000)
 
         async def on_message(event):
-            update = normalize_event(event, sources)
+            update = normalize_event(event, sources, topic_id)
             if update is not None:
                 await queue.put(update)
 
         client.add_event_handler(on_message, events.NewMessage(incoming=True, chats=list(sources)))
         logging.info("Personal account listening to %d allowed groups in %s mode", len(sources),
                      "EXECUTION" if broker else "PAPER")
+        logging.info("Source topic: %s", topic_id if topic_id is not None else "ALL (explicitly selected)")
         worker = asyncio.create_task(consume(queue, sources, journal, broker, policy))
         done, _ = await asyncio.wait((worker, client.disconnected), return_when=asyncio.FIRST_COMPLETED)
         for task in done:

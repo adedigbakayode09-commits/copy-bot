@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from personal_trade_bot import consume, main, normalize_event, personal_config, resolve_sources
+from personal_trade_bot import consume, main, normalize_event, personal_config, read_topic, resolve_sources
 from trade_bot import ExecutionPolicy, Journal
 
 
@@ -20,6 +20,31 @@ def event(chat=-1001, outgoing=False, service=None, group=True, channel=True):
 
 
 class PersonalTests(unittest.TestCase):
+    def test_topic_configuration_never_silently_defaults_to_every_topic(self):
+        self.assertEqual(read_topic({"SOURCE_TOPIC_ID": "5"}), 5)
+        self.assertIsNone(read_topic({"SOURCE_TOPIC_ID": "all"}))
+        for value in ("", "0", "-5", "bad", "5,6"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                read_topic({"SOURCE_TOPIC_ID": value})
+
+    def test_topic_accepts_direct_posts_and_replies_in_selected_topic(self):
+        for header in (SimpleNamespace(forum_topic=True, reply_to_top_id=None, reply_to_msg_id=5),
+                       SimpleNamespace(forum_topic=True, reply_to_top_id=5, reply_to_msg_id=4393)):
+            message = event(chat=-1004418162453)
+            message.message.reply_to = header
+            self.assertIsNotNone(normalize_event(message, {-1004418162453}, topic_id=5))
+
+    def test_other_topics_general_chat_and_ordinary_replies_are_excluded(self):
+        for header in (None, SimpleNamespace(forum_topic=True, reply_to_top_id=6, reply_to_msg_id=5),
+                       SimpleNamespace(forum_topic=True, reply_to_top_id=None, reply_to_msg_id=6),
+                       SimpleNamespace(forum_topic=False, reply_to_top_id=None, reply_to_msg_id=5)):
+            message = event(chat=-1004418162453)
+            message.message.reply_to = header
+            self.assertIsNone(normalize_event(message, {-1004418162453}, topic_id=5))
+        message = event(chat=-1002)
+        message.message.reply_to = SimpleNamespace(forum_topic=True, reply_to_top_id=5, reply_to_msg_id=4393)
+        self.assertIsNone(normalize_event(message, {-1004418162453}, topic_id=5))
+
     def test_login_failure_reports_error_type_without_private_error_message(self):
         with patch("sys.argv", ["personal_trade_bot.py", "--login"]), patch("personal_trade_bot.run", new=AsyncMock(side_effect=RuntimeError("private credential data"))):
             with self.assertRaises(SystemExit) as result:
