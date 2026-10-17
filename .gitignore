@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.session
+*.session-*
+/copy-bot-windows-download.zip
