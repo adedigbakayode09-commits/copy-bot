@@ -8,7 +8,7 @@ import logging
 import os
 from pathlib import Path
 
-from trade_bot import Journal, MT5Broker, execution_policy, process_update, read_sources
+from trade_bot import Journal, MT5Broker, entry_wait_seconds, execution_policy, process_update, process_waiting, read_sources
 
 
 def personal_config(environ):
@@ -38,23 +38,27 @@ def read_topic(environ):
     return topic
 
 
-def normalize_event(event, sources, topic_id=None):
+def normalize_event(event, sources, topic_id=None, edited=False):
     """Normalize only new incoming group/channel messages from the allowlist."""
     if event.chat_id not in sources or event.message.out or event.message.action:
         return None
     if not (event.is_group or event.is_channel):
         return None
+    reply = getattr(event.message, "reply_to", None)
+    actual_topic = 0
+    if reply is not None and getattr(reply, "forum_topic", False):
+        actual_topic = getattr(reply, "reply_to_top_id", None) or getattr(reply, "reply_to_msg_id", None) or 0
     if topic_id is not None:
-        reply = getattr(event.message, "reply_to", None)
         if reply is None or not getattr(reply, "forum_topic", False):
             return None
         # Replies within a topic identify the top message; direct topic posts
         # may identify only the topic starter in reply_to_msg_id.
-        actual_topic = getattr(reply, "reply_to_top_id", None) or getattr(reply, "reply_to_msg_id", None)
         if actual_topic != topic_id:
             return None
+    date = (getattr(event.message, "edit_date", None) if edited else None) or event.message.date
     return {"message": {"chat": {"id": event.chat_id}, "message_id": event.message.id,
-                        "date": event.message.date.timestamp(), "text": event.raw_text or ""}}
+                        "message_thread_id": actual_topic, "is_edit": edited,
+                        "date": date.timestamp(), "text": event.raw_text or ""}}
 
 
 def resolve_sources(environ, dialogs):
@@ -75,17 +79,24 @@ def resolve_sources(environ, dialogs):
     return matches
 
 
-async def consume(queue, sources, journal, broker, policy):
+async def consume(queue, sources, journal, broker, policy, execute_orders=True, wait_seconds=900, topic_id=None):
     while True:
-        update = await queue.get()
         try:
-            status = process_update(update, sources, journal, broker, policy=policy)
+            update = await asyncio.wait_for(queue.get(), timeout=2)
+        except asyncio.TimeoutError:
+            process_waiting(journal, broker, sources, topic_id, execute_orders=execute_orders)
+            continue
+        try:
+            status = process_update(update, sources, journal, broker, policy=policy,
+                                    execute_orders=execute_orders, wait_seconds=wait_seconds)
             logging.info("Source %s message %s: %s", update["message"]["chat"]["id"],
                          update["message"]["message_id"], status)
         finally:
             queue.task_done()
         # Keep sequential order submissions and let Telegram process network events.
         await asyncio.sleep(0)
+        if queue.empty():
+            process_waiting(journal, broker, sources, topic_id, execute_orders=execute_orders)
 
 
 async def run(args):
@@ -94,6 +105,7 @@ async def run(args):
     api_id, api_hash, session = personal_config(os.environ)
     topic_id = read_topic(os.environ) if not (args.login or args.list_chats) else None
     policy = execution_policy(os.environ)
+    wait_seconds = entry_wait_seconds(os.environ)
     session.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     client = TelegramClient(str(session), api_id, api_hash, sequential_updates=True)
     broker = journal = worker = None
@@ -123,24 +135,29 @@ async def run(args):
         sources = resolve_sources(os.environ, dialogs)
         if topic_id is not None and len(sources) != 1:
             raise ValueError("Select exactly one parent group when filtering by SOURCE_TOPIC_ID")
-        if args.execute:
+        if args.execute or getattr(args, "watch_mt5", False):
             import MetaTrader5 as mt5
             broker = MT5Broker(mt5, int(os.environ["MT5_ACCOUNT_ID"]), policy.total_lots, policy.target_lots)
         state = Path(os.environ.get("TRADE_BOT_STATE", "~/.local/state/copy-bot/trades.sqlite3")).expanduser()
         state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         journal = Journal(state)
+        journal.interrupt_waiting()
         queue = asyncio.Queue(maxsize=1000)
 
         async def on_message(event):
-            update = normalize_event(event, sources, topic_id)
+            update = normalize_event(event, sources, topic_id, edited=isinstance(event, events.MessageEdited.Event))
             if update is not None:
                 await queue.put(update)
 
         client.add_event_handler(on_message, events.NewMessage(incoming=True, chats=list(sources)))
+        client.add_event_handler(on_message, events.MessageEdited(incoming=True, chats=list(sources)))
         logging.info("Personal account listening to %d allowed groups in %s mode", len(sources),
-                     "EXECUTION" if broker else "PAPER")
+                     "EXECUTION" if args.execute else "PAPER")
+        if getattr(args, "watch_mt5", False):
+            logging.info("MT5 quotes enabled for paper waiting; order submission disabled")
         logging.info("Source topic: %s", topic_id if topic_id is not None else "ALL (explicitly selected)")
-        worker = asyncio.create_task(consume(queue, sources, journal, broker, policy))
+        worker = asyncio.create_task(consume(queue, sources, journal, broker, policy,
+                                            execute_orders=args.execute, wait_seconds=wait_seconds, topic_id=topic_id))
         done, _ = await asyncio.wait((worker, client.disconnected), return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task.result()  # Propagate submission failures; do not silently keep trading.
@@ -151,6 +168,7 @@ async def run(args):
                 await worker
         await client.disconnect()
         if journal:
+            journal.interrupt_waiting()
             journal.db.close()
         if broker:
             broker.mt5.shutdown()
@@ -162,6 +180,7 @@ def main():
     mode.add_argument("--login", action="store_true", help="Authorize locally using Telegram login prompts")
     mode.add_argument("--list-chats", action="store_true", help="List accessible groups/channels and numeric IDs")
     mode.add_argument("--execute", action="store_true", help="Place orders through the local Windows MT5 terminal")
+    mode.add_argument("--watch-mt5", action="store_true", help="Use local MT5 quotes to test waiting entries without placing orders")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger("telethon").setLevel(logging.WARNING)

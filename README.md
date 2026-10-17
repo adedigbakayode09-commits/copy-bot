@@ -33,6 +33,21 @@ The personal client keeps its authorization at `~/.local/state/copy-bot/telegram
 
 Only new incoming messages are processed; no history is replayed. Incoming messages go through one sequential worker. Any submission failure stops that worker and disconnects Telegram rather than continuing with later trades. An existing journal prevents re-submitting already processed messages across client changes and restarts. Use one process per personal session and trading journal.
 
+## Trader updates and waiting for entry
+
+The app observes all incoming text/captions in the selected topic, including ordinary conversation. It records these messages and their processing outcomes in the local `observations` journal table. Trading commands are recognized through explicit rules, not general language understanding. Arbitrary commentary never authorizes an order or automatically changes SL/TP.
+
+- **Pause/cancel:** phrases including `don't enter`, `dont enter anymore`, `do not enter`, `no more entries`, `cancel this setup`, `cancel pending orders`, or `pause entries` pause new entries and cancel any locally waiting setup in that topic.
+- **Resume:** explicit standalone instructions such as `resume entries`, `resume trading`, or `you can enter now` allow fresh signals. A resume never revives cancelled/blocked setups. A newer signal alone does not remove a pause.
+- A stop instruction wins over a resume phrase in the same message. Out-of-order older controls cannot override a newer control. Hypothetical text containing stop phrases may conservatively pause entries; review actual trader wording in paper mode.
+- New edits are inspected for stop/cancel instructions too. Edited messages cannot open trades or resume trading. State and controls are persisted per parent group/topic, surviving restart. Messages in other topics cannot change the selected topic's state.
+
+In `--execute` mode, a fresh valid signal whose price is outside its zone becomes a **locally waiting setup**. The worker checks quotes approximately every two seconds after processing incoming updates, and submits only once price reaches the zone and all MT5 checks pass. It does not place BUY LIMIT/SELL LIMIT pending orders in MT5. `ENTRY_WAIT_SECONDS` defaults to 900 seconds (15 minutes) from the signal timestamp; expired setups are not entered. A newer accepted signal supersedes the older waiting setup in that topic. Stop/cancel instructions cancel that wait before any later zone check.
+
+Waiting setups are discarded on shutdown/disconnect/restart, because a stop instruction may have been posted while the app was offline. Already submitted or filled positions are not closed by a pause. A cancellation cannot reverse fills or guarantee prevention of an order already in flight. There is no management of externally placed MT5 pending orders. Other trader commands, such as moving SL to breakeven or closing a position, are not implemented; provide actual examples before adding them.
+
+Normal paper mode observes signals and controls without connecting to MT5. To test actual quote-based waiting without sending orders, install the Windows MT5 requirements, set the intended `MT5_ACCOUNT_ID`, log into the terminal, and run `py personal_trade_bot.py --watch-mt5`. This mode performs read-only/order-preflight checks but never calls `order_send`; it logs `waiting` and `paper-ready` outcomes. Choose either `--watch-mt5` or `--execute`, never both.
+
 ## MT5 workflow
 
 Both Telegram clients share the same parser, journal, fixed sizing, and MT5 execution code. The commands in this section using `trade_bot.py` describe the optional Bot API workflow; for your personal-account workflow use `personal_trade_bot.py` and the setup above. The Bot API client requires adding a bot to source groups and cannot receive messages sent by other bots.
@@ -58,7 +73,7 @@ TP4: OPEN
 
 Here `4172-69` expands to the entry zone **4169–4172**. All three numeric targets, the open target, and the risk range are preserved. `OPEN` means an unspecified target, not a zero price. Numbered targets must be consecutive and progress in the trade direction; OPEN can only be last. A stop loss must be beyond the entire zone. The parser also accepts full-price ranges and `SELL` zones. Use full prices for ambiguous shorthand.
 
-Use the broker's exact symbol, including suffix and case. SL and at least one numeric TP are mandatory. Pending orders, images, edits, and trade-management instructions are not implemented. Unrecognized messages are ignored.
+Use the broker's exact symbol, including suffix and case. SL and at least one numeric TP are mandatory. MT5 pending limit orders, image-only signals, edited signal execution, and SL/TP/close management instructions are not implemented. Explicit stop/cancel/resume controls are supported as described above. Unrecognized commentary is recorded locally without sending orders.
 
 The configured sizing rule is **0.1 lot total per signal**, for buys and sells alike:
 
@@ -98,7 +113,7 @@ py trade_bot.py
 
 To explicitly enable automatic order placement, use `py trade_bot.py --execute` after configuring the intended account. Begin verification on a demo account. There is no per-signal approval queue, aggregate exposure limit, or daily-loss limit; execution mode automatically submits recognized eligible signals using the fixed lots above. Paper mode remains the default.
 
-Execution requires a fresh signal (at most 120 seconds old), a quote at most 30 seconds old, current price inside the entry zone (or within 0.1% for a single entry price), valid SL/TP, supported per-position volume, fill-or-kill support, and successful MT5 `order_check` results for every portion before any order is sent. Account, quote, and order checks run again before each submission. These are market orders, not orders guaranteed to fill at the signal's entry. A zone message received while price is outside the zone is rejected; this version does not wait for a later entry. Broker checks can reject orders. Demo and live accounts both require the explicit `--execute` flag; no orders have been tested against a terminal in this cloud environment.
+A signal must be fresh (at most 120 seconds old) when first received. Execution then requires an unexpired setup, entries not paused, a quote at most 30 seconds old, price inside the entry zone (or within 0.1% for a single entry price), valid SL/TP, supported per-position volume, fill-or-kill support, and successful MT5 `order_check` results for every portion before any order is sent. Account, quote, and order checks run again before each submission. These are market orders when the zone is reached, not orders guaranteed to fill at the stated entry. Broker checks can reject orders. Demo and live accounts both require the explicit `--execute` flag; no orders have been tested against a terminal in this cloud environment.
 
 The SQLite journal at `~/.local/state/copy-bot/trades.sqlite3` prevents processing the same chat/message twice, including across restarts and paper-to-execution switches. Override with `TRADE_BOT_STATE`. Preserve this file and run one process per Telegram bot token; do not run `copy_bot.py` simultaneously with `trade_bot.py` using the same token. Orders are submitted sequentially, so the three-position batch is not atomic: a later portion can fail after an earlier one fills. A submission failure or uncertain outcome stops the process and leaves the signal `submitting`; no portion of that message is automatically retried. The `executions` table records each attempted order and its return code/order/deal IDs, when received. Inspect the MT5 terminal before taking action. Earlier positions are not automatically closed on failure. Journal storage is not encrypted and should remain private. Old recognized signals are ignored rather than traded after downtime.
 

@@ -40,7 +40,7 @@ In the same PowerShell window:
 .\.venv\Scripts\python.exe personal_trade_bot.py
 ```
 
-It should report that it is listening to one allowed group in **PAPER** mode and show **Source topic: 5**. This is TheGoldenEdge V2 inside TheGoldenEdgeVIP, not the group's other topics. It listens to new incoming messages only; it does not replay old signals. When a new recognized signal arrives, it logs the parsed signal and the selected lot allocation. No orders are sent in this mode. Press **Ctrl+C** to stop.
+It should report that it is listening to one allowed group in **PAPER** mode and show **Source topic: 5**. This is TheGoldenEdge V2 inside TheGoldenEdgeVIP, not the group's other topics. It listens to new incoming messages only; it does not replay old signals. When a new recognized signal arrives, it logs the parsed signal and the selected lot allocation. Stop phrases such as `don't enter` pause fresh entries and cancel locally waiting setups; `resume entries` allows fresh signals again. The pause survives restart. Edits can pause but cannot open trades or resume. No orders are sent in this mode. Press **Ctrl+C** to stop.
 
 Your settings are 0.1 lot total: 0.05 at TP1, 0.03 at TP2, 0.02 at TP3; no open portion. The signal's risk percentage is ignored for sizing, and the signal SL is retained.
 
@@ -57,5 +57,7 @@ After closing PowerShell, repeat the API-credential and source-variable commands
 ## MT5 is a separate connection
 
 Telegram authorization does not enable trading. The MT5 execution connection still needs the intended account number, an installed/logged-in Windows terminal, a hedging account for the three TP positions, and the broker's exact gold symbol. See README.md for execution instructions and demo verification. This Windows setup guide stays in paper mode.
+
+For quote-based paper testing after MT5 is configured, use `personal_trade_bot.py --watch-mt5`. It waits for the entry zone without sending orders. Execution mode uses the same waiting logic with actual orders enabled. A wait expires after 15 minutes by default (`ENTRY_WAIT_SECONDS=900`), a newer setup replaces an older waiting one, and disconnect cancels outstanding local waits. A stop cannot undo an order already submitted or filled. MT5 pending limit orders and automatic position-close/SL changes are not implemented.
 
 To get help, share the success message or a redacted error. Do not send codes, passwords, API credentials, or session files.

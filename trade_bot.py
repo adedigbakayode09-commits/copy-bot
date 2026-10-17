@@ -167,12 +167,45 @@ class PreparedTrade:
     requests: tuple[dict, ...]
 
 
+class EntryNotReady(ValueError):
+    """Valid signal whose current quote has not reached its entry zone."""
+
+
+def entry_wait_seconds(environ):
+    try:
+        seconds = int(environ.get("ENTRY_WAIT_SECONDS", "900"))
+    except ValueError:
+        raise ValueError("ENTRY_WAIT_SECONDS must be an integer") from None
+    if not 1 <= seconds <= 86400:
+        raise ValueError("ENTRY_WAIT_SECONDS must be between 1 and 86400")
+    return seconds
+
+
+def entry_instruction(text):
+    """Recognize explicit entry controls; never infer permission from ordinary chat."""
+    text = " ".join(text.casefold().replace("’", "'").split())
+    stop = (r"\b(?:don'?t|do not|never)\s+(?:enter|take\s+(?:the\s+)?(?:trade|entry)|open\s+(?:new\s+)?(?:trades|positions))\b",
+            r"\b(?:no more|no new)\s+(?:entries|entry|trades)\b",
+            r"\b(?:cancel|pause|stop)\s+(?:(?:all|new|the|this|pending|buy|sell)\s+)*(?:entries|entry|orders|trading|limits|setup)\b",
+            r"\b(?:setup|entry|entries)\s+(?:(?:is|are)\s+)?cancel(?:led|ed)\b",
+            r"\bstay out\b")
+    if any(re.search(pattern, text) for pattern in stop):
+        return "pause"
+    if re.fullmatch(r"(?:resume (?:entries|trading)|entries resumed|you can enter (?:now|again)|enter again)[.! ]*", text):
+        return "resume"
+    return None
+
+
 class Journal:
     def __init__(self, path):
         self.db = sqlite3.connect(path)
         self.db.execute("CREATE TABLE IF NOT EXISTS messages (chat INTEGER, message INTEGER, status TEXT, PRIMARY KEY(chat, message))")
         self.db.execute("CREATE TABLE IF NOT EXISTS signals (chat INTEGER, message INTEGER, payload TEXT, PRIMARY KEY(chat, message))")
         self.db.execute("CREATE TABLE IF NOT EXISTS executions (chat INTEGER, message INTEGER, leg INTEGER, request TEXT, result TEXT, PRIMARY KEY(chat, message, leg))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS entry_state (chat INTEGER, topic INTEGER, paused INTEGER, stamp REAL, message INTEGER, PRIMARY KEY(chat, topic))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS controls (chat INTEGER, topic INTEGER, message INTEGER, stamp REAL, command TEXT, PRIMARY KEY(chat, topic, message, stamp, command))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS observations (chat INTEGER, topic INTEGER, message INTEGER, stamp REAL, edited INTEGER, text TEXT, status TEXT, PRIMARY KEY(chat, topic, message, stamp, edited))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS waiting_entries (chat INTEGER, topic INTEGER, message INTEGER, signal TEXT, expires REAL, status TEXT, PRIMARY KEY(chat, topic, message))")
         self.db.commit()
 
     def claim(self, chat, message, status, signal=None):
@@ -190,6 +223,60 @@ class Journal:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO executions VALUES (?, ?, ?, ?, ?)",
                             (chat, message, leg, json.dumps(request), json.dumps(result)))
+
+    def observe(self, message, status):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO observations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (message["chat"]["id"], message.get("message_thread_id", 0), message["message_id"],
+                             message.get("date", 0), int(message.get("is_edit", False)),
+                             message.get("text") or message.get("caption") or "", status))
+
+    def entries_paused(self, chat, topic):
+        row = self.db.execute("SELECT paused FROM entry_state WHERE chat=? AND topic=?", (chat, topic)).fetchone()
+        return bool(row and row[0])
+
+    def apply_control(self, message, command):
+        chat, topic = message["chat"]["id"], message.get("message_thread_id", 0)
+        stamp, message_id = message["date"], message["message_id"]
+        with self.db:
+            cursor = self.db.execute("INSERT OR IGNORE INTO controls VALUES (?, ?, ?, ?, ?)",
+                                     (chat, topic, message_id, stamp, command))
+            if not cursor.rowcount:
+                return "duplicate-control"
+            previous = self.db.execute("SELECT stamp, message FROM entry_state WHERE chat=? AND topic=?", (chat, topic)).fetchone()
+            if previous and (stamp, message_id) < previous:
+                return "outdated-control"
+            self.db.execute("INSERT OR REPLACE INTO entry_state VALUES (?, ?, ?, ?, ?)",
+                            (chat, topic, int(command == "pause"), stamp, message_id))
+            if command == "pause":
+                self.cancel_waiting(chat, topic, "cancelled")
+        return "entries-paused" if command == "pause" else "entries-resumed"
+
+    def cancel_waiting(self, chat, topic, status):
+        self.db.execute("UPDATE messages SET status=? WHERE chat=? AND message IN (SELECT message FROM waiting_entries WHERE chat=? AND topic=? AND status='waiting')",
+                        (status, chat, chat, topic))
+        self.db.execute("UPDATE waiting_entries SET status=? WHERE chat=? AND topic=? AND status='waiting'", (status, chat, topic))
+
+    def wait_for_entry(self, message, signal, seconds):
+        chat, topic = message["chat"]["id"], message.get("message_thread_id", 0)
+        with self.db:
+            self.cancel_waiting(chat, topic, "superseded")
+            self.db.execute("INSERT INTO waiting_entries VALUES (?, ?, ?, ?, ?, 'waiting')",
+                            (chat, topic, message["message_id"], json.dumps(asdict(signal)), message["date"] + seconds))
+            self.db.execute("UPDATE messages SET status='waiting' WHERE chat=? AND message=?", (chat, message["message_id"]))
+
+    def finish_waiting(self, chat, topic, message, status):
+        with self.db:
+            self.db.execute("UPDATE waiting_entries SET status=? WHERE chat=? AND topic=? AND message=?", (status, chat, topic, message))
+            self.db.execute("UPDATE messages SET status=? WHERE chat=? AND message=?", (status, chat, message))
+
+    def interrupt_waiting(self):
+        # A stop instruction may have been posted while disconnected. Do not
+        # resume an old setup after a crash or a disconnected session.
+        with self.db:
+            scopes = self.db.execute("SELECT DISTINCT chat, topic FROM waiting_entries WHERE status='waiting'").fetchall()
+            for chat, topic in scopes:
+                self.cancel_waiting(chat, topic, "interrupted")
 
 
 class MT5Broker:
@@ -220,9 +307,9 @@ class MT5Broker:
             raise ValueError("Market price is invalid")
         if signal.entry_low != signal.entry_high:
             if not signal.entry_low <= price <= signal.entry_high:
-                raise ValueError("Market price is outside the signal entry zone")
+                raise EntryNotReady("Market price is outside the signal entry zone")
         elif abs(price - signal.entry) / signal.entry > 0.001:
-            raise ValueError("Market price is more than 0.1% from signal entry")
+            raise EntryNotReady("Market price is more than 0.1% from signal entry")
         if not (signal.sl < price < signal.tp if signal.side == "BUY" else signal.tp < price < signal.sl):
             raise ValueError("Current price is outside SL/TP")
         if not info.filling_mode & 1:
@@ -283,39 +370,95 @@ class MT5Broker:
         return results
 
 
-def process_update(update, sources, journal, broker=None, now=None, policy=None):
+def process_update(update, sources, journal, broker=None, now=None, policy=None, execute_orders=True, wait_seconds=900):
     message = update.get("message") or update.get("channel_post")
     if not message or message.get("chat", {}).get("id") not in sources:
         return "ignored"
+
+    def report(status):
+        journal.observe(message, status)
+        return status
+
+    journal.observe(message, "received")
     now = time.time() if now is None else now
     timestamp = message.get("date", 0)
     if not isinstance(timestamp, (int, float)) or not 0 <= now - timestamp <= 120:
-        return "stale"
+        return report("stale")
+    text = message.get("text") or message.get("caption") or ""
+    instruction = entry_instruction(text)
+    if instruction == "pause" or (instruction == "resume" and not message.get("is_edit")):
+        return report(journal.apply_control(message, instruction))
+    if message.get("is_edit"):
+        return report("edited-ignored")
     try:
-        signal = parse_signal(message.get("text") or message.get("caption") or "")
+        signal = parse_signal(text)
     except ValueError:
-        return "unrecognized"
+        return report("unrecognized")
     chat, message_id = message["chat"]["id"], message["message_id"]
     # Persist intent before sending. An uncertain order is NEVER retried automatically.
     if not journal.claim(chat, message_id, "preparing" if broker else "paper", signal):
-        return "duplicate"
+        return report("duplicate")
+    if journal.entries_paused(chat, message.get("message_thread_id", 0)):
+        journal.finish(chat, message_id, "blocked-paused")
+        return report("blocked-paused")
+    with journal.db:
+        journal.cancel_waiting(chat, message.get("message_thread_id", 0), "superseded")
     if broker:
         try:
             request = broker.prepare(signal)
+        except EntryNotReady:
+            journal.wait_for_entry(message, signal, wait_seconds)
+            return report("waiting")
         except ValueError:
             journal.finish(chat, message_id, "rejected")
-            return "rejected"
-        journal.finish(chat, message_id, "submitting")
-        broker.execute(request, record=lambda leg, request, result: journal.record_order(chat, message_id, leg, request, result))
-        journal.finish(chat, message_id, "executed")
-        return "executed"
+            return report("rejected")
+        if execute_orders:
+            journal.finish(chat, message_id, "submitting")
+            broker.execute(request, record=lambda leg, request, result: journal.record_order(chat, message_id, leg, request, result))
+            journal.finish(chat, message_id, "executed")
+            return report("executed")
+        journal.finish(chat, message_id, "paper-ready")
+        return report("paper-ready")
     logging.info("Paper signal: %s", json.dumps(asdict(signal)))
     try:
         allocations = (policy or ExecutionPolicy()).allocations(signal)
         logging.info("Paper fixed-lot allocation (risk %% ignored): %s", allocations)
     except ValueError as error:
         logging.info("Paper allocation pending: %s", error)
-    return "paper"
+    return report("paper")
+
+
+def process_waiting(journal, broker, sources, topic_id=None, now=None, execute_orders=True):
+    if broker is None:
+        return
+    now = time.time() if now is None else now
+    rows = journal.db.execute("SELECT chat, topic, message, signal, expires FROM waiting_entries WHERE status='waiting' ORDER BY message").fetchall()
+    for chat, topic, message, payload, expires in rows:
+        if chat not in sources or (topic_id is not None and topic != topic_id):
+            continue
+        if journal.entries_paused(chat, topic):
+            journal.finish_waiting(chat, topic, message, "cancelled")
+            continue
+        if now >= expires:
+            journal.finish_waiting(chat, topic, message, "expired")
+            logging.info("Waiting setup %s expired", message)
+            continue
+        data = json.loads(payload)
+        data["targets"] = tuple(data["targets"])
+        if data["risk_percent"] is not None:
+            data["risk_percent"] = tuple(data["risk_percent"])
+        try:
+            plan = broker.prepare(Signal(**data))
+        except EntryNotReady:
+            continue
+        except ValueError:
+            journal.finish_waiting(chat, topic, message, "rejected")
+            continue
+        journal.finish_waiting(chat, topic, message, "submitting" if execute_orders else "paper-ready")
+        if execute_orders:
+            broker.execute(plan, record=lambda leg, request, result: journal.record_order(chat, message, leg, request, result))
+            journal.finish_waiting(chat, topic, message, "executed")
+        logging.info("Waiting setup %s: %s", message, "executed" if execute_orders else "paper-ready")
 
 
 def main():
@@ -336,6 +479,7 @@ def main():
     try:
         token, sources = read_config(os.environ)
         policy = execution_policy(os.environ)
+        wait_seconds = entry_wait_seconds(os.environ)
         if args.execute:
             import MetaTrader5 as mt5
             broker = MT5Broker(mt5, int(os.environ["MT5_ACCOUNT_ID"]), policy.total_lots, policy.target_lots)
@@ -344,6 +488,7 @@ def main():
     path = Path(os.environ.get("TRADE_BOT_STATE", "~/.local/state/copy-bot/trades.sqlite3")).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     journal = Journal(path)
+    journal.interrupt_waiting()
     api = Telegram(token)
     api.call("getMe")
     if api.call("getWebhookInfo").get("url"):
@@ -353,17 +498,20 @@ def main():
     try:
         while True:
             try:
-                updates = api.call("getUpdates", offset=offset, timeout=30,
+                waiting = journal.db.execute("SELECT 1 FROM waiting_entries WHERE status='waiting' LIMIT 1").fetchone()
+                updates = api.call("getUpdates", offset=offset, timeout=2 if waiting else 30,
                                    allowed_updates=["message", "channel_post"])
             except TelegramError as error:
                 logging.warning("%s; retrying in 10 seconds", error)
                 time.sleep(10)
                 continue
             for update in updates:
-                status = process_update(update, sources, journal, broker, policy=policy)
+                status = process_update(update, sources, journal, broker, policy=policy, wait_seconds=wait_seconds)
                 logging.info("Update %s: %s", update["update_id"], status)
                 offset = update["update_id"] + 1
+            process_waiting(journal, broker, sources)
     finally:
+        journal.interrupt_waiting()
         journal.db.close()
         if broker:
             broker.mt5.shutdown()

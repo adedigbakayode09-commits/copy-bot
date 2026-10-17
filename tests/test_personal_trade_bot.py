@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from personal_trade_bot import consume, main, normalize_event, personal_config, read_topic, resolve_sources
-from trade_bot import ExecutionPolicy, Journal
+from trade_bot import EntryNotReady, ExecutionPolicy, Journal
 
 
 SAMPLE = (Path(__file__).parent / "fixtures" / "xau_buy.txt").read_text(encoding="utf-8")
@@ -26,6 +26,16 @@ class PersonalTests(unittest.TestCase):
         for value in ("", "0", "-5", "bad", "5,6"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 read_topic({"SOURCE_TOPIC_ID": value})
+
+    def test_edited_stop_keeps_topic_and_uses_edit_timestamp(self):
+        message = event(chat=-1004418162453)
+        message.raw_text = "don't enter anymore"
+        message.message.reply_to = SimpleNamespace(forum_topic=True, reply_to_top_id=5, reply_to_msg_id=4393)
+        message.message.edit_date = datetime.fromtimestamp(1100, timezone.utc)
+        result = normalize_event(message, {-1004418162453}, topic_id=5, edited=True)
+        self.assertTrue(result["message"]["is_edit"])
+        self.assertEqual(result["message"]["date"], 1100)
+        self.assertEqual(result["message"]["message_thread_id"], 5)
 
     def test_topic_accepts_direct_posts_and_replies_in_selected_topic(self):
         for header in (SimpleNamespace(forum_topic=True, reply_to_top_id=None, reply_to_msg_id=5),
@@ -94,6 +104,31 @@ class PersonalTests(unittest.TestCase):
 
 
 class PersonalWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queued_stop_cancels_wait_before_next_price_check(self):
+        journal = Journal(":memory:")
+        self.addCleanup(journal.db.close)
+        queue = asyncio.Queue()
+        signal = normalize_event(event(), {-1001})
+        stop = normalize_event(event(), {-1001})
+        stop["message"]["message_id"] = 8
+        stop["message"]["text"] = "dont enter anymore"
+        await queue.put(signal)
+        await queue.put(stop)
+        broker = Mock()
+        broker.prepare.side_effect = EntryNotReady("Outside zone")
+        with patch("trade_bot.time.time", return_value=1001):
+            worker = asyncio.create_task(consume(queue, {-1001}, journal, broker, ExecutionPolicy()))
+            try:
+                await asyncio.wait_for(queue.join(), timeout=2)
+            finally:
+                worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
+        broker.prepare.assert_called_once()
+        broker.execute.assert_not_called()
+        self.assertTrue(journal.entries_paused(-1001, 0))
+        self.assertEqual(journal.db.execute("SELECT status FROM waiting_entries").fetchone()[0], "cancelled")
+
     async def test_incoming_signal_reaches_paper_journal_without_submitting(self):
         journal = Journal(":memory:")
         self.addCleanup(journal.db.close)
